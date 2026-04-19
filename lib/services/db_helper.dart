@@ -2,19 +2,20 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart'; // Windows için
 import '../models/stok_model.dart';
 
 class DbHelper {
+  // Resim Ana Dizini
+  static const String resimAnaYolu = r'C:\wamp\www\OC3\image\catalog';
+  static const String dbPath =
+      r'C:\Users\koksa\flutter\stok_takip_flutter\lib\services\data.s3db';
+  //r'\\server\MrmDeskCe\data.s3db';
   static Database? _db;
 
   Future<Database> get db async {
     if (_db != null) return _db!;
 
-    // Windows üzerinde sqlite başlatma
     sqfliteFfiInit();
     var databaseFactory = databaseFactoryFfi;
 
-    // Veritabanı dosyanızın yolu (Örn: Masaüstündeki dosya)
-    // Gerçek projede bunu 'path_provider' ile uygulama içine almalısın
-    String dbPath = "//server/MrmDeskCe/data.s3db";
-
+    // Yukarıdaki merkezi 'dbYolu' değişkenini kullanıyoruz
     _db = await databaseFactory.openDatabase(dbPath);
     return _db!;
   }
@@ -22,7 +23,6 @@ class DbHelper {
   // Tüm stokları getir (Lazarus: StokData.Open)
   Future<List<Stok>> getStokListesi() async {
     var dbClient = await db;
-    // Senin paylaştığın şemaya göre: SELECT * FROM STOK
     List<Map<String, dynamic>> list = await dbClient.rawQuery(
       'SELECT * FROM STOK ORDER BY KIMLIK DESC',
     );

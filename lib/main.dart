@@ -12,8 +12,7 @@ class StokTakipApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Stok Takip Flutter',
-      debugShowCheckedModeBanner:
-          false, // Sağ üstteki "debug" yazısını kaldırır
+      debugShowCheckedModeBanner: true, // Sağ üstteki "debug" yazısını kaldırır
       theme: ThemeData(
         primarySwatch: Colors.blue,
         useMaterial3: true, // Modern görünüm için
