@@ -2,6 +2,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import '../services/opencart_service.dart'; // Oluşturduğumuz OpenCart servis dosyası
 import '../models/stok_model.dart';
 import '../services/db_helper.dart';
 import 'package:http/http.dart' as http;
@@ -19,6 +20,10 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
     with SingleTickerProviderStateMixin {
   List<Stok> _stokListesi = []; // Veritabanından gelen orijinal tam liste
   List<Stok> _filtreliListe = []; // Ekranda süzülen (arama sonuçları) liste
+
+  final OpenCartService _ocService = OpenCartService();
+  bool _isOcConnected = false;
+  String? _ocProductId; // Ürün varsa ID'sini burada tutacağız
 
   final TextEditingController _aramaController = TextEditingController();
   late TabController _tabController;
@@ -75,8 +80,86 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
   void dispose() {
     _c['kur_dolar']?.removeListener(_kurlariHesapla);
     _c['kur_euro']?.removeListener(_kurlariHesapla);
+    _c.forEach((key, controller) {
+      controller.dispose();
+    });
     super.dispose();
   }
+
+  Future<void> _idSorgula() async {
+    // Artik _stokKodController yerine _c['stok_kod'] kullanıyoruz
+    String arananKod = _c['stok_kod']?.text.trim() ?? "";
+
+    if (arananKod.isNotEmpty) {
+      String? id = await _ocService.urunIdSorgula(arananKod);
+      setState(() {
+        _ocProductId = id;
+      });
+      print("Sorgulama yapıldı: $arananKod -> ID: $id");
+    } else {
+      print("Sorgulama yapılamadı: Stok kodu alanı boş.");
+    }
+  }
+
+  void _ocBaglantisiniYonet() async {
+    if (!_isOcConnected) {
+      bool sonuc = await _ocService.baglan(manuelBaslatma: true);
+      setState(() {
+        _isOcConnected = sonuc; // Servisten gelen gerçek sonucu ata
+      });
+
+      if (sonuc) {
+        _idSorgula(); // Bağlantı kurulur kurulmaz seçili ürünü sorgula
+      }
+    } else {
+      await _ocService.kapat();
+      setState(() {
+        _isOcConnected = false;
+        _ocProductId = null;
+      });
+    }
+  }
+
+  // SENKRONİZASYON (YÜKLE/GÜNCELLE) DÜZELTİLMİŞ FONKSİYON
+  void _ocSenkronizeEt() async {
+    bool basarili = false;
+
+    // DÜZELTME: Tüm verileri _c map'inden çekiyoruz
+    String kod = _c['stok_kod']?.text ?? "";
+    String ad = _c['stok_adi']?.text ?? "";
+    String barkod = _c['barkod']?.text ?? "";
+    double fiyat =
+        double.tryParse(_c['satis']?.text.replaceAll(',', '.') ?? '0') ?? 0;
+    int miktar = int.tryParse(_c['miktar']?.text ?? '0') ?? 0;
+    String aciklama = _c['metaTitle']?.text ?? "";
+
+    if (_ocProductId == null) {
+      basarili = await _ocService.urunEkle(
+        model: kod,
+        ad: ad,
+        barkod: barkod,
+        fiyat: fiyat,
+        miktar: miktar,
+        aciklama: aciklama,
+      );
+    } else {
+      basarili = await _ocService.urunGuncelle(
+        productId: _ocProductId!,
+        fiyat: fiyat,
+        miktar: miktar,
+        ad: ad,
+      );
+    }
+
+    if (basarili) {
+      String? yeniId = await _ocService.urunIdSorgula(kod.trim());
+      if (!mounted) return;
+      setState(() => _ocProductId = yeniId);
+      _mesajGoster("OpenCart İşlemi Başarılı!");
+    }
+  }
+  // ... _stokBilgisiSekmesi içindeki Column yapısı ve yerleşimi gönderdiğin dosyada doğruydu ...
+  // Sadece butonların onPressed olaylarının bu yeni fonksiyonlara baktığından emin ol.
 
   Future<void> _linkiAc(String urlString) async {
     if (urlString.isEmpty) {
@@ -217,16 +300,22 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
   }
 
   Future<void> _initDatabase() async {
-    sqfliteFfiInit();
-    var databaseFactory = databaseFactoryFfi;
-    String path = DbHelper.dbPath;
-
     try {
-      _db = await databaseFactory.openDatabase(path);
-      setState(() => _isDbInitialized = true);
-      _verileriGetir();
+      // DİKKAT: openDatabase demiyoruz, DbHelper içindeki hazır bağlantıyı istiyoruz.
+      _db = await DbHelper().db;
+
+      if (_db != null && _db!.isOpen) {
+        _mesajGoster(">>> Bağlantı başarılı, veriler çekiliyor...");
+        setState(() {
+          _isDbInitialized = true;
+        });
+        await _verileriGetir();
+      } else {
+        throw "Veritabanı bağlantısı açılamadı!";
+      }
     } catch (e) {
-      _mesajGoster("Bağlantı Hatası: $e");
+      // print(">>> KRİTİK HATA: $e");
+      _mesajGoster("Bağlantı kurulamadı: $e", hata: true);
     }
   }
 
@@ -234,6 +323,7 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
     if (_db == null) return;
 
     try {
+      // Sorgu sonucunu beklerken (await) hata olursa catch yakalayacak
       final List<Map<String, dynamic>> maps = await _db!.query(
         'STOK',
         orderBy: 'LDATE DESC',
@@ -241,11 +331,18 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
 
       setState(() {
         _stokListesi = maps.map((item) => Stok.fromMap(item)).toList();
-        // KRİTİK: Başlangıçta filtreli liste tam listeye eşit olmalı
         _filtreliListe = List.from(_stokListesi);
       });
+      _mesajGoster(
+        ">>> Veriler başarıyla yüklendi: ${_stokListesi.length} adet.",
+      );
     } catch (e) {
-      _mesajGoster("Veri yükleme hatası: $e");
+      //print(">>> Sorgu Hatası: $e");
+      _mesajGoster("Liste çekilemedi: $e", hata: true);
+      // Hata olsa bile halkayı durdurmak için:
+      setState(() {
+        _isDbInitialized = true;
+      });
     }
   }
 
@@ -500,8 +597,6 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
             onPressed: _guncelKurlariCek,
           ),
 
-          IconButton(icon: const Icon(Icons.save), onPressed: () {}),
-
           IconButton(
             icon: const Icon(Icons.add_box_outlined),
             tooltip: "Yeni Ürün Ekle",
@@ -516,7 +611,16 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
         ],
       ),
       body: !_isDbInitialized
-          ? const Center(child: CircularProgressIndicator())
+          ? const Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 16),
+                  Text("Veritabanı bağlantısı kuruluyor..."),
+                ],
+              ),
+            )
           : Row(
               children: [
                 // --- SOL LİSTE (Arama ve Ürünler) ---
@@ -556,10 +660,16 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
                           itemBuilder: (context, index) {
                             final stok = _filtreliListe[index];
                             return ListTile(
+                              dense: false,
+                              visualDensity: const VisualDensity(
+                                horizontal: 0,
+                                vertical: -4,
+                              ),
                               title: Text(
                                 stok.stokAdi,
                                 style: const TextStyle(
                                   fontWeight: FontWeight.bold,
+                                  fontSize: 12,
                                 ),
                               ),
                               subtitle: Text(
@@ -569,12 +679,28 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
                               selectedTileColor: Colors.blue.withValues(
                                 alpha: 0.1,
                               ),
-                              onTap: () {
+                              onTap: () async {
+                                // 1. Sadece 'varsa' uyandırır, yoksa zorlamaz (baglan içindeki kontrol sayesinde)
+                                bool baglantiVarMi = await _ocService.baglan();
+
+                                // 2. YEREL İŞLEMLER (Her zaman çalışır)
                                 _formuDoldur(stok);
                                 setState(() {
-                                  _formAcikMi =
-                                      false; // Ürün seçildiği için "yeni" modundan çık
+                                  _formAcikMi = false;
+                                  _seciliStok = stok;
+                                  _isOcConnected =
+                                      baglantiVarMi; // Bağlantı durumunu güncel tutalım
                                 });
+
+                                // 3. OPENCART İŞLEMİ (Sadece bağlantı varsa)
+                                if (baglantiVarMi) {
+                                  _idSorgula();
+                                } else {
+                                  print(
+                                    "OpenCart bağlantısı aktif değil, sadece yerel bilgiler yüklendi.",
+                                  );
+                                  // Burada SnackBar göstermene gerek yok, çünkü bağlantı kurmamak senin tercihin.
+                                }
                               },
                             );
                           },
@@ -638,6 +764,27 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
                 ),
               ],
             ),
+    );
+  }
+
+  Widget _statusBar() {
+    return Align(
+      alignment: Alignment.bottomRight,
+      child: Padding(
+        padding: const EdgeInsets.all(8.0),
+        child: Tooltip(
+          message:
+              "Veritabanı: ${DbHelper.dbPath}\nResim: ${DbHelper.resimAnaYolu}",
+          child: Text(
+            "Aktif Bağlantı: ${DbHelper.dbPath.split('\\').last}", // Sadece dosya adını gösterir
+            style: TextStyle(
+              color: Colors.blueGrey,
+              fontSize: 12,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -811,9 +958,48 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
                   ),
                 ),
 
-                const Divider(),
+                // 1. BUTON: OPENCARTBAĞLANTI BUTONU
+                const SizedBox(height: 1),
+                ElevatedButton.icon(
+                  onPressed: _ocBaglantisiniYonet,
+                  icon: Icon(_isOcConnected ? Icons.link : Icons.link_off),
+                  label: Text(
+                    _isOcConnected
+                        ? "OPENCART BAĞLANTISI AKTİF"
+                        : "OPENCART'A BAĞLAN",
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _isOcConnected
+                        ? Colors.green.shade700
+                        : Colors.grey.shade700,
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size(double.infinity, 40),
+                  ),
+                ),
 
-                const SizedBox(height: 10),
+                // 2. BUTON: OPENCART SENKRONİZASYONU BUTONU (Sadece bağlantı varken görünür)
+                const SizedBox(height: 1),
+                if (_isOcConnected)
+                  ElevatedButton.icon(
+                    onPressed: _ocSenkronizeEt,
+                    // ID yoksa "Yükle", varsa "Güncelle" ikonu ve yazısı
+                    icon: Icon(
+                      _ocProductId == null ? Icons.cloud_upload : Icons.sync,
+                    ),
+                    label: Text(
+                      _ocProductId == null
+                          ? "ÜRÜNÜ OPENCART'A YÜKLE"
+                          : "BİLGİLERİ GÜNCELLE",
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.orange.shade800,
+                      foregroundColor: Colors.white,
+                      minimumSize: const Size(double.infinity, 45),
+                    ),
+                  ),
+
+                // 3. BUTON: STOK KAYDET/ GÜNCELLE BUTONU
+                const SizedBox(height: 1),
                 ElevatedButton.icon(
                   onPressed: _stokKaydet,
                   icon: const Icon(Icons.save),
@@ -834,6 +1020,7 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
             child: Column(
               children: [
                 Container(
+                  //Resim gösteren kutu
                   height: 350, // Biraz daha büyüttüm
                   width: double.infinity,
                   decoration: BoxDecoration(
@@ -879,6 +1066,11 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
                           ],
                         ),
                 ),
+
+                if (_isOcConnected && _ocProductId != null) ...[
+                  const SizedBox(height: 15),
+                  _buildOpenCartKarsilastirmaPaneli(),
+                ],
               ],
             ),
           ),
@@ -918,6 +1110,7 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
             ],
           ),
           const Divider(height: 50),
+          _statusBar(),
           // Bilgilendirme veya ekstra butonlar buraya gelebilir
           Row(
             children: [
@@ -983,6 +1176,108 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
           },
         ),
       ),
+    );
+  }
+
+  // BU İKİSİ BAŞKA FONKSİYONLARIN İÇİNDE OLMAMALI, AYRI OLMALI
+  Widget _buildOpenCartKarsilastirmaPaneli() {
+    if (!_isOcConnected || _ocProductId == null) return const SizedBox.shrink();
+
+    return FutureBuilder<Map<String, dynamic>?>(
+      future: _ocService.urunDetayGetir(_ocProductId!),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Padding(
+            padding: EdgeInsets.all(8.0),
+            child: LinearProgressIndicator(),
+          );
+        }
+
+        final ocData = snapshot.data;
+        if (ocData == null) return const SizedBox.shrink();
+
+        return Container(
+          width: double.infinity,
+          margin: const EdgeInsets.only(top: 10, bottom: 10),
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Colors.blue.shade50,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: Colors.blue.shade200, width: 1.5),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.cloud_sync, color: Colors.blue),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      "OpenCart Canlı: ${ocData['name'] ?? ''}",
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 14,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const Divider(color: Colors.blue),
+              Wrap(
+                spacing: 30,
+                runSpacing: 12,
+                children: [
+                  _ocVeriSutunu(
+                    "STOK MİKTARI",
+                    "${ocData['quantity'] ?? 0} Adet",
+                    Icons.inventory,
+                  ),
+                  _ocVeriSutunu(
+                    "FİYAT",
+                    "${double.tryParse(ocData['price'].toString())?.toStringAsFixed(2) ?? '0.00'} TL",
+                    Icons.sell,
+                  ),
+                  _ocVeriSutunu(
+                    "BARKOD / SKU",
+                    "${ocData['ean'] ?? '-'} / ${ocData['sku'] ?? '-'}",
+                    Icons.qr_code,
+                  ),
+
+                  _ocVeriSutunu(
+                    "BEDEN / LOT",
+                    "${ocData['location'] ?? '-'}",
+                    Icons.straighten,
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _ocVeriSutunu(String baslik, String deger, IconData icon) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 14, color: Colors.blueGrey),
+            const SizedBox(width: 4),
+            Text(
+              baslik,
+              style: const TextStyle(fontSize: 10, color: Colors.blueGrey),
+            ),
+          ],
+        ),
+        Text(
+          deger,
+          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+        ),
+      ],
     );
   }
 }

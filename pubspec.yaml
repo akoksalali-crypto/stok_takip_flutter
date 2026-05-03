@@ -37,7 +37,7 @@ dependencies:
   barcode_widget: ^2.0.4   # Barkod üretimi (Lazarus'taki BarcodeQR karşılığı)
   intl: ^0.20.2            # Para birimi ve tarih formatı
   url_launcher: ^6.2.1     # WhatsApp ve Web Linkleri açmak için
-  printing: ^5.11.0        # Fiş ve Rapor yazdırma
+  mysql_client: ^0.0.27  
 
 
   # The following adds the Cupertino Icons font to your application.
