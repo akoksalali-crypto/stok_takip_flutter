@@ -12,6 +12,7 @@
 .swiftpm/
 migrate_working_dir/
 *.s3db
+Microsoft/
 
 # IntelliJ related
 *.iml

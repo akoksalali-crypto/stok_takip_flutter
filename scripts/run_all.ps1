@@ -1,0 +1,20 @@
+Copy-Item -Path c:\Users\koksa\Desktop\Flutter\temp_unzip\stok_takip_flutter\lib\views\stok_ana_sayfa.dart -Destination c:\Users\koksa\Desktop\Flutter\stok_takip_flutter\lib\views\stok_ana_sayfa.dart -Force
+dart scripts/refactor_stock_list.dart
+dart scripts/fix_stock_list.dart
+dart scripts/refactor_stock_form_ui.dart
+dart scripts/refactor_stock_form_ui_2.dart
+dart scripts/refactor_stock_form_ui_3.dart
+dart scripts/refactor_stock_form_ui_4.dart
+dart scripts/update_stok_sil.dart
+dart scripts/inject_controller.dart
+dart scripts/fix_errors_2.dart
+dart scripts/fix_errors_3.dart
+dart scripts/fix_errors_4.dart
+dart scripts/fix_errors_5.dart
+dart scripts/final_cleanup.dart
+dart scripts/refactor_opencart.dart
+dart scripts/refactor_opencart_2.dart
+dart scripts/refactor_opencart_3.dart
+dart scripts/fix_references.dart
+dart scripts/fix_corruption.dart
+dart scripts/fix_leftovers.dart

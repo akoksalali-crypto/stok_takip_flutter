@@ -1,2 +1,0 @@
-C:\Users\koksa\flutter\stok_takip_flutter\lib\services\data.s3db
-C:\wamp\www\OC3\image\catalog

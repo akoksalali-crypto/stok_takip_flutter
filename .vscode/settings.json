@@ -1,3 +1,4 @@
 {
-    "cmake.sourceDirectory": "C:/Users/koksa/flutter/stok_takip_flutter/windows"
+    "cmake.sourceDirectory": "C:/Users/koksa/Desktop/Flutter/stok_takip_flutter/linux",
+    "cmake.ignoreCMakeListsMissing": true
 }

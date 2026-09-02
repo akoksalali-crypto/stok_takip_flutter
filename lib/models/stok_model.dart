@@ -21,12 +21,11 @@ class Stok {
   final String? kdv; // <-- YENİ EKLENEN SATIR
   final String? lot; // <-- YENİ EKLENEN SATIR
   final String? weight; // <-- YENİ EKLENEN SATIR
-  final String? webLink;
+  String? webLink;
   final String? metaTitle;
   final String? Fdate; // <-- ilk giriş tarihi
   final String? Ldate; // <-- Son giriş tarihi
   final String? beden; // <-- YENİ EKLENEN SATIR
-
   final String? image; // <-- YENİ EKLENEN SATIR
 
   Stok({
@@ -46,21 +45,22 @@ class Stok {
     this.dolarSatis,
     this.euroSatis,
     this.miktar,
-    this.marj, // <-- YENİ EKLENEN SATIR
-    this.kdv, // <-- YENİ EKLENEN SATIR
-    this.lot, // <-- YENİ EKLENEN SATIR
-    this.weight, // <-- YENİ EKLENEN SATIR
-    this.metaTitle, // <-- YENİ EKLENEN SATIR
-    this.webLink, // <-- YENİ EKLENEN SATIR
-    this.image, // <-- YENİ EKLENEN SATIR
+    this.marj,
+    this.kdv,
+    this.lot,
+    this.weight,
+    this.metaTitle,
+    this.webLink,
+    this.image, // image datayolu (örneğin: "images/urun1.jpg") veya URL olabilir
     this.Fdate, // <-- ilk giriş tarihi
     this.Ldate, // <-- Son giriş tarihi
-    this.beden, // beden bilgisi (örneğin: S, M, L, XL) - <-- YENİ EKLENEN SATIR
+    this.beden, // beden bilgisi (örneğin: S, M, L, XL) -
   });
 
   factory Stok.fromMap(Map<String, dynamic> json) {
-    var hamMiktar = json['MIKTAR'] ?? "0";
-    String temizMiktar = double.parse(hamMiktar.toString()).toInt().toString();
+    final rawMiktar = (json['MIKTAR'] ?? "0").toString().replaceAll(',', '.').trim();
+    final parsedMiktar = double.tryParse(rawMiktar);
+    final temizMiktar = (parsedMiktar != null ? parsedMiktar.toInt() : 0).toString();
     return Stok(
       id: json['KIMLIK'],
       stokKod: json['STOK_KOD'],
@@ -85,7 +85,7 @@ class Stok {
       weight: json['WEIGHT']?.toString(), // <-- YENİ EKLENEN SATIR
       metaTitle: json['META_TITLE']?.toString(), // <-- YENİ EKLENEN SATIR
       webLink: json['WebLink']?.toString(), // <-- YENİ EKLENEN SATIR
-      image: json['image']?.toString(), // <-- YENİ EKLENEN SATIR
+      image: json['IMAGE']?.toString(), // <-- YENİ EKLENEN SATIR
       Fdate: json['FDATE']?.toString(), // <-- ilk giriş tarihi
       Ldate: json['LDATE']?.toString(), // <-- Son giriş tarihi
       beden: json['TART']?.toString(), // <-- YENİ EKLENEN SATIR
@@ -117,7 +117,7 @@ class Stok {
       'WEIGHT': weight,
       'META_TITLE': metaTitle,
       'WebLink': webLink,
-      'image': image,
+      'IMAGE': image,
       'FDATE': Fdate,
       'LDATE': Ldate,
       'TART': beden,

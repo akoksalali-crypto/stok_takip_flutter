@@ -9,6 +9,7 @@
             "name": "stok_takip_flutter",
             "request": "launch",
             "type": "dart"
+            "console": "debugConsole"
         },
         {
             "name": "stok_takip_flutter (profile mode)",

@@ -1,13 +1,52 @@
+// ignore_for_file: deprecated_member_use, avoid_print
+
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
-import 'package:sqflite_common_ffi/sqflite_ffi.dart';
-import '../services/opencart_service.dart'; // Oluşturduğumuz OpenCart servis dosyası
+import 'package:flutter/services.dart';
+import 'package:get/get.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+import '../controllers/opencart_controller.dart';
+import '../controllers/printer_controller.dart';
+import '../controllers/settings_controller.dart';
+import '../controllers/stock_form_controller.dart';
+import '../controllers/stock_list_controller.dart';
 import '../models/stok_model.dart';
 import '../services/db_helper.dart';
-import 'package:http/http.dart' as http;
-import 'dart:convert';
-import 'package:url_launcher/url_launcher.dart';
+import '../services/kur_service.dart';
+import '../utils/app_theme.dart';
+import '../utils/ui_utils.dart';
+
+import 'widgets/ayarlar_tab_widget.dart';
+import 'widgets/barkodlar_tab_widget.dart';
+import 'widgets/custom_input_widget.dart';
+import 'widgets/doviz_fiyatlar_tab_widget.dart';
+import 'widgets/kur_fiyat_alani_widget.dart';
+import 'widgets/opencart_preview_widget.dart';
+import 'widgets/resim_goster_widget.dart';
+import 'widgets/sol_urun_listesi_widget.dart';
+import 'widgets/stok_detay_form_widget.dart';
+import 'widgets/toplu_duzenleme_tab_widget.dart';
+
+class MyHttpOverrides extends HttpOverrides {
+  @override
+  HttpClient createHttpClient(SecurityContext? context) {
+    return super.createHttpClient(context)
+      ..badCertificateCallback = (X509Certificate cert, String host, int port) {
+        // Güvenlik: Sadece localhost, yerel ağ veya bilinen sunucu ipleri için SSL hatalarını yoksay.
+        if (host == 'localhost' || 
+            host == '127.0.0.1' || 
+            host.startsWith('192.168.') || 
+            host.startsWith('10.') || 
+            host == '93.89.225.215') {
+          return true;
+        }
+        return false;
+      };
+  }
+}
 
 class StokAnaSayfa extends StatefulWidget {
   const StokAnaSayfa({super.key});
@@ -18,156 +57,695 @@ class StokAnaSayfa extends StatefulWidget {
 
 class _StokAnaSayfaState extends State<StokAnaSayfa>
     with SingleTickerProviderStateMixin {
-  List<Stok> _stokListesi = []; // Veritabanından gelen orijinal tam liste
-  List<Stok> _filtreliListe = []; // Ekranda süzülen (arama sonuçları) liste
+  late final StockFormController stockFormController;
+  late final StockListController stockListController;
+  late final OpenCartController openCartController;
+  late final PrinterController printerController;
+  late final SettingsController settingsController;
 
-  final OpenCartService _ocService = OpenCartService();
-  bool _isOcConnected = false;
-  String? _ocProductId; // Ürün varsa ID'sini burada tutacağız
+  final DbHelper dbHelper = DbHelper();
+  final KurService _kurService = KurService(); // Canlı Döviz Kur Servisi
 
-  final TextEditingController _aramaController = TextEditingController();
-  late TabController _tabController;
-  Database? _db;
-  bool _isDbInitialized = false;
-  Stok? _seciliStok;
-  bool _formAcikMi = false;
+  late TabController _tabController; // Sekme kontrolcüsü
 
-  // Kontrolcüler (Lazarus: TEdit karşılıkları) /_c haritasına (Map) şu yeni anahtarları ekleyelim:
-  final Map<String, TextEditingController> _c = {
-    'stok_kod': TextEditingController(),
-    'stok_adi': TextEditingController(),
-    'barkod': TextEditingController(),
-    'barkod2': TextEditingController(),
-    'barkod3': TextEditingController(),
-    'barkod4': TextEditingController(),
-    'barkod5': TextEditingController(),
-    'barkod6': TextEditingController(),
-    'barkod7': TextEditingController(),
-    'alis': TextEditingController(),
-    'satis': TextEditingController(),
-    'dolar_alis': TextEditingController(),
-    'dolar_satis': TextEditingController(),
-    'euro_satis': TextEditingController(),
-    'miktar': TextEditingController(),
-    'marj': TextEditingController(),
-    'kdv': TextEditingController(),
-    'min_adet': TextEditingController(),
-    'lot': TextEditingController(),
-    'weight': TextEditingController(),
-    'metaTitle': TextEditingController(),
-    'webLink': TextEditingController(),
-    'Fdate': TextEditingController(),
-    'Ldate': TextEditingController(),
-    'beden': TextEditingController(),
-    'kur_dolar': TextEditingController(),
-    'kur_euro': TextEditingController(),
-    'parite_euro_dolar': TextEditingController(),
-    'parite_dolar_euro': TextEditingController(),
-  };
+  // Veritabanı bağlantısının tamamlanma durumu StockListController üzerinden takip ediliyor
+  // Paylaşılacak fiyat verileri seçimleri
+  final RxBool _seciliTl = true.obs;
+  final RxBool _seciliEuro = false.obs;
+  final RxBool _seciliDolar = false.obs;
+
+  final TextEditingController _adetController = TextEditingController(
+    text: "1",
+  );
+  final TextEditingController _findController = TextEditingController();
+  final TextEditingController _replaceController = TextEditingController();
+  Timer? _aramaTimer;
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 4, vsync: this);
-    _initDatabase();
-    // Dolar veya Euro değiştiği an pariteyi hesapla (Sürekli dinleme modu)
-    _c['kur_dolar']?.addListener(_kurlariHesapla);
-    _c['kur_euro']?.addListener(_kurlariHesapla);
+    settingsController = Get.put(SettingsController());
+    stockFormController = Get.put(StockFormController());
+    stockListController = Get.put(StockListController());
+    openCartController = Get.put(OpenCartController());
+    printerController = Get.put(PrinterController());
+    // SSL Sertifika hatalarını (özellikle yerel wamp / server bağlantıları için) küresel olarak yok sayıyoruz
+    HttpOverrides.global = MyHttpOverrides();
+
+    _tabController = TabController(length: 5, vsync: this);
+
+    _guncelKurlariCek(); // Kurları başlangıçta çek
+
+    settingsController.c['kur_dolar']?.addListener(
+      stockFormController.kurlariHesapla,
+    ); // Dolar kuru değiştiğinde pariteyi tetikle
+    settingsController.c['kur_euro']?.addListener(
+      stockFormController.kurlariHesapla,
+    ); // Euro kuru değiştiğinde pariteyi tetikle
   }
 
-  // Dispose ederken listener'ları temizlemeyi unutma (Bellek sağlığı için)
   @override
   void dispose() {
-    _c['kur_dolar']?.removeListener(_kurlariHesapla);
-    _c['kur_euro']?.removeListener(_kurlariHesapla);
-    _c.forEach((key, controller) {
-      controller.dispose();
-    });
+    settingsController.c['kur_dolar']?.removeListener(
+      stockFormController.kurlariHesapla,
+    );
+    settingsController.c['kur_euro']?.removeListener(
+      stockFormController.kurlariHesapla,
+    );
+    _adetController.dispose();
+    _tabController.dispose();
+    _findController.dispose();
+    _replaceController.dispose();
+    _aramaTimer?.cancel();
+    Get.delete<PrinterController>();
+    Get.delete<OpenCartController>();
+    Get.delete<StockListController>();
+    Get.delete<StockFormController>();
+    Get.delete<SettingsController>();
     super.dispose();
   }
 
-  Future<void> _idSorgula() async {
-    // Artik _stokKodController yerine _c['stok_kod'] kullanıyoruz
-    String arananKod = _c['stok_kod']?.text.trim() ?? "";
+  void _aramaOdaklan() {
+    stockListController.aramaFocusNode.requestFocus();
+    stockListController.aramaController.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: stockListController.aramaController.text.length,
+    );
+  }
 
-    if (arananKod.isNotEmpty) {
-      String? id = await _ocService.urunIdSorgula(arananKod);
-      setState(() {
-        _ocProductId = id;
-      });
-      print("Sorgulama yapıldı: $arananKod -> ID: $id");
-    } else {
-      print("Sorgulama yapılamadı: Stok kodu alanı boş.");
+  void _aramaTemizle() {
+    if (stockListController.aramaController.text.isNotEmpty) {
+      stockListController.aramaController.clear();
+      _aramaYap("");
     }
   }
 
-  void _ocBaglantisiniYonet() async {
-    if (!_isOcConnected) {
-      bool sonuc = await _ocService.baglan(manuelBaslatma: true);
-      setState(() {
-        _isOcConnected = sonuc; // Servisten gelen gerçek sonucu ata
-      });
+  @override
+  Widget build(BuildContext context) {
+    return Obx(() => stockListController.isDbInitialized.value
+        ? CallbackShortcuts(
+            bindings: <ShortcutActivator, VoidCallback>{
+              const SingleActivator(LogicalKeyboardKey.f2): _yeniUrunHazirla,
+              const SingleActivator(LogicalKeyboardKey.f3): _aramaOdaklan,
+              const SingleActivator(LogicalKeyboardKey.keyF, control: true): _aramaOdaklan,
+              const SingleActivator(LogicalKeyboardKey.f5): () async {
+                await _verileriGetir();
+                await _guncelKurlariCek();
+              },
+              const SingleActivator(LogicalKeyboardKey.keyS, control: true): _stokKaydet,
+              const SingleActivator(LogicalKeyboardKey.keyP, control: true): () {
+                if (stockFormController.seciliStok.value != null) {
+                  _barkodBasimiBaslat(context);
+                }
+              },
+              const SingleActivator(LogicalKeyboardKey.keyD, control: true): _stokDataUrunKopyala,
+              const SingleActivator(LogicalKeyboardKey.delete): () {
+                if (stockFormController.seciliStok.value != null) {
+                  _stokSilOnayli();
+                }
+              },
+              const SingleActivator(LogicalKeyboardKey.escape): _aramaTemizle,
+            },
+            child: Focus(
+              autofocus: true,
+              child: Scaffold(
+                backgroundColor: AppColors.bgLight,
+                appBar: AppBar(
+                  toolbarHeight: 52,
+                  backgroundColor: Colors.white,
+                  surfaceTintColor: Colors.transparent,
+                  elevation: 0,
+                  bottom: const PreferredSize(
+                    preferredSize: Size.fromHeight(1),
+                    child: Divider(height: 1, color: AppColors.borderLight),
+                  ),
+                  title: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // Uygulama Logosu & Başlık
+                        Container(
+                          padding: const EdgeInsets.all(6),
+                          decoration: BoxDecoration(
+                            color: AppColors.primary.withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: const Icon(
+                            Icons.inventory_2_rounded,
+                            color: AppColors.primary,
+                            size: 20,
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        const Text(
+                          "Stok Takip & Yönetim",
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.bold,
+                            color: AppColors.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(width: 16),
+                        _openCartStatusBadge(),
+                      ],
+                    ),
+                  ),
+                  actions: [
+                    _headerActionButton(
+                      icon: Icons.sync_rounded,
+                      label: "Yenile",
+                      shortcut: "F5",
+                      onPressed: () async => await _verileriGetir(),
+                    ),
+                    _headerActionButton(
+                      icon: Icons.currency_exchange_rounded,
+                      label: "Kurlar",
+                      onPressed: _guncelKurlariCek,
+                    ),
+                    _headerActionButton(
+                      icon: Icons.copy_rounded,
+                      label: "Kopyala",
+                      shortcut: "Ctrl+D",
+                      onPressed: _stokDataUrunKopyala,
+                    ),
+                    _headerActionButton(
+                      icon: Icons.add_circle_outline_rounded,
+                      label: "Yeni Ürün",
+                      shortcut: "F2",
+                      isAccent: true,
+                      onPressed: _yeniUrunHazirla,
+                    ),
+                    _headerActionButton(
+                      icon: Icons.save_rounded,
+                      label: "Kaydet",
+                      shortcut: "Ctrl+S",
+                      isPrimary: true,
+                      onPressed: _stokKaydet,
+                    ),
+                    Obx(
+                      () => stockFormController.seciliStok.value == null
+                          ? const SizedBox.shrink()
+                          : _headerActionButton(
+                              icon: Icons.delete_outline_rounded,
+                              label: "Sil",
+                              shortcut: "Del",
+                              isDanger: true,
+                              onPressed: _stokSilOnayli,
+                            ),
+                    ),
+                    const SizedBox(width: 6),
+                    IconButton(
+                      tooltip: "Programdan Çıkış Yap",
+                      icon: const Icon(Icons.power_settings_new_rounded, color: AppColors.danger, size: 22),
+                      onPressed: () => _cikisOnayi(context),
+                    ),
+                    const SizedBox(width: 10),
+                  ],
+                ),
+                body: Column(
+                  children: [
+                    Expanded(
+                      child: Row(
+                        children: [
+                          // --- 1. KOLON: ANA ÜRÜN LİSTESİ ---
+                          Container(
+                            width: 380,
+                            decoration: const BoxDecoration(
+                              color: Colors.white,
+                              border: Border(
+                                right: BorderSide(
+                                  color: AppColors.borderLight,
+                                  width: 1,
+                                ),
+                              ),
+                            ),
+                            child: Obx(() => _buildSolUrunListesi()),
+                          ),
 
-      if (sonuc) {
-        _idSorgula(); // Bağlantı kurulur kurulmaz seçili ürünü sorgula
-      }
-    } else {
-      await _ocService.kapat();
-      setState(() {
-        _isOcConnected = false;
-        _ocProductId = null;
-      });
-    }
+                          // --- 2. KOLON: TAB YAPISI (Orta) ---
+                          Expanded(
+                            flex: 2,
+                            child: Column(
+                              children: [
+                                Container(
+                                  color: Colors.white,
+                                  child: TabBar(
+                                    controller: _tabController,
+                                    labelColor: AppColors.primary,
+                                    unselectedLabelColor: AppColors.textSecondary,
+                                    indicatorColor: AppColors.primary,
+                                    indicatorSize: TabBarIndicatorSize.tab,
+                                    isScrollable: true,
+                                    tabs: const [
+                                      Tab(text: "Stok Bilgisi"),
+                                      Tab(text: "Barkodlar"),
+                                      Tab(text: "Döviz & Fiyatlar"),
+                                      Tab(text: "Bul ve Değiştir"),
+                                      Tab(text: "Ayarlar"),
+                                    ],
+                                  ),
+                                ),
+                                Expanded(
+                                  child: TabBarView(
+                                    controller: _tabController,
+                                    children: [
+                                      _stokBilgisiSekmesi(),
+                                      Obx(() => BarkodlarTabWidget(
+                                        isStokSelected: stockFormController.seciliStok.value != null,
+                                        stokAdi: stockFormController.c['stok_adi']?.text ?? '',
+                                        satisFiyati: stockFormController.c['satis']?.text ?? '0',
+                                        basilacakBarkodDegeri: stockFormController.c[stockFormController.basilacakBarkodKey.value]?.text ?? '',
+                                        basilacakBarkodKey: stockFormController.basilacakBarkodKey.value,
+                                        onBasilacakBarkodKeyChanged: (k) => stockFormController.basilacakBarkodKey.value = k,
+                                        buildInput: _input,
+                                        yaziciListesi: printerController.yaziciListesi.toList(),
+                                        seciliYazici: printerController.seciliYazici.value,
+                                        onYaziciChanged: (val) {
+                                          if (val != null) {
+                                            printerController.seciliYazici.value = val;
+                                          }
+                                        },
+                                        adetController: _adetController,
+                                        barkodBasimiBaslat: _barkodBasimiBaslat,
+                                      )),
+                                      Obx(() => DovizFiyatlarTabWidget(
+                                        buildInput: _input,
+                                        fiyatlariDovizeCevir: () => stockFormController.fiyatlariDovizeCevir(),
+                                        sabitfiyatlariDovizeCevir: () => stockFormController.sabitfiyatlariDovizeCevir(),
+                                        guncelKurlariCek: _guncelKurlariCek,
+                                        sabitAyarlariYaz: settingsController.sabitAyarlariYaz,
+                                        isStokSelected: stockFormController.seciliStok.value != null,
+                                        stokAdi: stockFormController.c['stok_adi']?.text ?? '',
+                                        satisFiyati: stockFormController.c['satis']?.text ?? '0',
+                                        dolarSatis: stockFormController.c['dolar_satis']?.text ?? '0',
+                                        euroSatis: stockFormController.c['euro_satis']?.text ?? '0',
+                                      )),
+                                      TopluDuzenlemeTabWidget(
+                                        filtreliSonuclarLength: stockListController.filtreliSonuclar.length,
+                                        solHizliAramaListesi: _solHizliAramaListesi(),
+                                        findController: _findController,
+                                        onHizliAra: _hizliAra,
+                                        replaceController: _replaceController,
+                                        onTopluDegistir: _topluDegistirIslemi,
+                                      ),
+                                      _ayarlarSekmesi(),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+
+                          // --- 3. KOLON: RESİM ALANI (En Sağ) ---
+                          Obx(
+                            () => (stockFormController.seciliStok.value != null ||
+                                    stockListController.formAcikMi.value)
+                                ? Container(
+                                    width: 300,
+                                    padding: const EdgeInsets.all(10),
+                                    decoration: const BoxDecoration(
+                                      border: Border(
+                                        left: BorderSide(
+                                          color: AppColors.borderLight,
+                                        ),
+                                      ),
+                                      color: Colors.white,
+                                    ),
+                                    child: SingleChildScrollView(
+                                      child: Obx(() => ResimGosterWidget(
+                                        stokAdi: stockFormController.c['stok_adi']?.text ?? "",
+                                        stokKod: stockFormController.c['stok_kod']?.text ?? "",
+                                        resimAnaYolu: DbHelper.resimAnaYolu,
+                                        fiyatTl: stockFormController.c['satis']?.text ?? '0',
+                                        fiyatEuro: stockFormController.c['euro_satis']?.text ?? '0',
+                                        fiyatDolar: stockFormController.c['dolar_satis']?.text ?? '0',
+                                        onWhatsappIlePaylas: _whatsappIlePaylas,
+                                        seciliTl: _seciliTl.value,
+                                        seciliEuro: _seciliEuro.value,
+                                        seciliDolar: _seciliDolar.value,
+                                        onSeciliTlChanged: (v) => _seciliTl.value = v,
+                                        onSeciliEuroChanged: (v) => _seciliEuro.value = v,
+                                        onSeciliDolarChanged: (v) => _seciliDolar.value = v,
+                                        isOcConnected: openCartController.isOcConnected.value,
+                                        onOcBaglantisiniYonet: _ocBaglantisiniYonet,
+                                        onStokKaydet: _stokKaydet,
+                                        onStokSilOnayli: _stokSilOnayli,
+                                        onStokDataUrunKopyala: _stokDataUrunKopyala,
+                                        buildInput: _input,
+                                        webLinkController: stockFormController.c['webLink']!,
+                                        onLinkiAc: _linkiAc,
+                                      )),
+                                    ),
+                                  )
+                                : const SizedBox.shrink(),
+                          ),
+                        ],
+                      ),
+                    ),
+                    _statusBar(context),
+                  ],
+                ),
+              ),
+            ),
+          )
+        : const Scaffold(body: Center(child: CircularProgressIndicator())));
   }
 
-  // SENKRONİZASYON (YÜKLE/GÜNCELLE) DÜZELTİLMİŞ FONKSİYON
-  void _ocSenkronizeEt() async {
-    bool basarili = false;
-
-    // DÜZELTME: Tüm verileri _c map'inden çekiyoruz
-    String kod = _c['stok_kod']?.text ?? "";
-    String ad = _c['stok_adi']?.text ?? "";
-    String barkod = _c['barkod']?.text ?? "";
-    double fiyat =
-        double.tryParse(_c['satis']?.text.replaceAll(',', '.') ?? '0') ?? 0;
-    int miktar = int.tryParse(_c['miktar']?.text ?? '0') ?? 0;
-    String aciklama = _c['metaTitle']?.text ?? "";
-
-    if (_ocProductId == null) {
-      basarili = await _ocService.urunEkle(
-        model: kod,
-        ad: ad,
-        barkod: barkod,
-        fiyat: fiyat,
-        miktar: miktar,
-        aciklama: aciklama,
+  Widget _openCartStatusBadge() {
+    return Obx(() {
+      final bool isConnected = openCartController.isOcConnected.value;
+      return InkWell(
+        onTap: _ocBaglantisiniYonet,
+        borderRadius: BorderRadius.circular(20),
+        child: Tooltip(
+          message: isConnected ? "OpenCart Bağlantısını Kes" : "OpenCart'a Bağlan",
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            decoration: BoxDecoration(
+              color: isConnected
+                  ? AppColors.success.withValues(alpha: 0.1)
+                  : AppColors.surfaceSubtle,
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: isConnected ? AppColors.success : AppColors.borderLight,
+                width: 1,
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: isConnected ? AppColors.success : AppColors.textMuted,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  isConnected ? "OC3 Bağlı" : "OC3 Çevrimdışı",
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    color: isConnected ? AppColors.success : AppColors.textSecondary,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       );
-    } else {
-      basarili = await _ocService.urunGuncelle(
-        productId: _ocProductId!,
-        fiyat: fiyat,
-        miktar: miktar,
-        ad: ad,
-      );
-    }
-
-    if (basarili) {
-      String? yeniId = await _ocService.urunIdSorgula(kod.trim());
-      if (!mounted) return;
-      setState(() => _ocProductId = yeniId);
-      _mesajGoster("OpenCart İşlemi Başarılı!");
-    }
+    });
   }
-  // ... _stokBilgisiSekmesi içindeki Column yapısı ve yerleşimi gönderdiğin dosyada doğruydu ...
-  // Sadece butonların onPressed olaylarının bu yeni fonksiyonlara baktığından emin ol.
 
-  Future<void> _linkiAc(String urlString) async {
-    if (urlString.isEmpty) {
-      _mesajGoster("Web adresi girilmemiş!", hata: true);
+  Widget _headerActionButton({
+    required IconData icon,
+    required String label,
+    String? shortcut,
+    required VoidCallback onPressed,
+    bool isPrimary = false,
+    bool isAccent = false,
+    bool isDanger = false,
+  }) {
+    Color bg;
+    Color fg;
+    BorderSide border;
+
+    if (isPrimary) {
+      bg = AppColors.primary;
+      fg = Colors.white;
+      border = BorderSide.none;
+    } else if (isAccent) {
+      bg = AppColors.secondary.withValues(alpha: 0.12);
+      fg = AppColors.secondary;
+      border = BorderSide(color: AppColors.secondary.withValues(alpha: 0.3), width: 1);
+    } else if (isDanger) {
+      bg = AppColors.danger.withValues(alpha: 0.1);
+      fg = AppColors.danger;
+      border = BorderSide(color: AppColors.danger.withValues(alpha: 0.3), width: 1);
+    } else {
+      bg = Colors.white;
+      fg = AppColors.textPrimary;
+      border = const BorderSide(color: AppColors.borderLight, width: 1);
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 3.0),
+      child: Tooltip(
+        message: shortcut != null ? "$label ($shortcut)" : label,
+        child: InkWell(
+          onTap: onPressed,
+          borderRadius: BorderRadius.circular(8),
+          child: Container(
+            height: 36,
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: bg,
+              borderRadius: BorderRadius.circular(8),
+              border: border != BorderSide.none ? Border.fromBorderSide(border) : null,
+              boxShadow: isPrimary
+                  ? [
+                      BoxShadow(
+                        color: AppColors.primary.withValues(alpha: 0.25),
+                        blurRadius: 4,
+                        offset: const Offset(0, 2),
+                      ),
+                    ]
+                  : null,
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 16, color: fg),
+                const SizedBox(width: 5),
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: fg,
+                    fontSize: 12,
+                    fontWeight: isPrimary ? FontWeight.bold : FontWeight.w600,
+                  ),
+                ),
+                if (shortcut != null) ...[
+                  const SizedBox(width: 5),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: isPrimary
+                          ? Colors.white.withValues(alpha: 0.25)
+                          : AppColors.surfaceSubtle,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Text(
+                      shortcut,
+                      style: TextStyle(
+                        fontSize: 9.5,
+                        fontWeight: FontWeight.bold,
+                        color: isPrimary ? Colors.white : AppColors.textMuted,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _cikisOnayi(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Çıkış"),
+        content: const Text("Programı kapatmak istediğinize emin misiniz?"),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("İptal"),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.danger),
+            onPressed: () => exit(0),
+            child: const Text("Çıkış Yap"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _topluDegistirIslemi() async {
+    String eskiKelime = _findController.text.trim();
+    String yeniKelime = _replaceController.text.trim();
+
+    if (eskiKelime.isEmpty || stockListController.filtreliSonuclar.isEmpty) {
+      UiUtils.showMessage("Önce değiştirilecek geçerli bir kelime aratın.", hata: true);
       return;
     }
 
-    // Protokol kontrolü (http/https yoksa ekle)
+    bool? onay = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Toplu Değişiklik Onayı"),
+        content: Text(
+          "Şu anda listede görünen ${stockListController.filtreliSonuclar.length} adet kayıtta "
+          "'$eskiKelime' kelimesi '$yeniKelime' olarak değiştirilecek.\n\n"
+          "Emin misiniz?",
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text("Vazgeç"),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text("Evet, Değiştir"),
+          ),
+        ],
+      ),
+    );
+
+    if (onay != true) return;
+
+    try {
+      final etkilenenSatir = await stockListController.topluIsimGuncelleVeYenile(
+        eskiKelime,
+        yeniKelime,
+      );
+
+      UiUtils.showMessage("$etkilenenSatir kayıt başarıyla güncellendi.");
+
+      _findController.clear();
+      _replaceController.clear();
+      // setState kaldırıldı, UI zaten dinliyor.
+    } catch (e) {
+      UiUtils.showMessage("Hata oluştu: $e", hata: true);
+    }
+  }
+
+  Widget _solHizliAramaListesi() {
+    return Obx(() => ListView.builder(
+      physics: const NeverScrollableScrollPhysics(),
+      shrinkWrap: true,
+      itemCount: stockListController.filtreliSonuclar.length,
+      itemBuilder: (context, index) {
+        final urun = stockListController.filtreliSonuclar[index];
+        return ListTile(
+          title: Text(urun['STOK_ADI'] ?? ""),
+          subtitle: Text(urun['STOK_KOD'] ?? ""),
+        );
+      },
+    ));
+  }
+
+  void _hizliAra(String kelime) {
+    if (_aramaTimer?.isActive ?? false) _aramaTimer!.cancel();
+
+    if (kelime.trim().length < 2) {
+      if (stockListController.filtreliSonuclar.isNotEmpty) {
+        stockListController.filtreliSonuclar.clear();
+      }
+      return;
+    }
+
+    _aramaTimer = Timer(const Duration(milliseconds: 400), () async {
+      try {
+        final sonuclar = await dbHelper.stokAra(kelime.trim());
+        if (mounted) {
+          stockListController.filtreliSonuclar.assignAll(sonuclar);
+        }
+      } catch (e) {
+        print("Hızlı arama hatası: $e");
+      }
+    });
+  }
+
+  void _barkodBasimiBaslat(
+    BuildContext context, {
+    String? tiklananBarkodKey,
+  }) async {
+    String hedefKey = tiklananBarkodKey ?? 'barkod';
+
+    String barkod = stockFormController.c[hedefKey]?.text.trim() ?? "";
+    String ad = stockFormController.c['stok_adi']?.text.trim() ?? "";
+    String fiyat = stockFormController.c['satis']?.text.trim() ?? "";
+    String miktar = _adetController.text.trim().isEmpty
+        ? "1"
+        : _adetController.text.trim();
+
+    printerController.barkodBasimiBaslat(
+      barkod: barkod,
+      ad: ad,
+      fiyat: fiyat,
+      miktar: miktar,
+      hedefKey: hedefKey,
+    );
+  }
+
+
+
+  Future<void> _urunSec(Stok stok) async {
+    stockListController.urunSec(
+      stok,
+      stockFormController.formuDoldur,
+      openCartController.connect,
+    );
+
+    await openCartController.seciliUrunuYukle(
+      autoSync: openCartController.autoSync.value,
+    );
+  }
+
+  Widget _buildSolUrunListesi() {
+    return SolUrunListesiWidget(
+      aramaController: stockListController.aramaController,
+      aramaFocusNode: stockListController.aramaFocusNode,
+      onAramaChanged: _aramaYap,
+      onAramaClear: () {
+        stockListController.aramaController.clear();
+        _aramaYap("");
+      },
+      seciliSiralama: stockListController.seciliSiralama.value,
+      onSiralamaDegistir: (yeni) => stockListController.siralamaDegistir(yeni),
+      filtreliListe: stockListController.filtreliListe.toList(),
+      seciliStok: stockFormController.seciliStok.value,
+      listScrollController: stockListController.listScrollController,
+      onUrunTap: (stok) {
+        _urunSec(stok);
+      },
+    );
+  }
+
+  Widget _buildBosDurumMesaji() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            Icons.inventory_2_outlined,
+            size: 80,
+            color: Colors.grey.shade400,
+          ),
+          const SizedBox(height: 16),
+          Text(
+            "Düzenlemek için ürün seçin...",
+            style: TextStyle(color: Colors.grey.shade600, fontSize: 16),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _linkiAc(String urlString) async {
+    if (urlString.isEmpty) {
+      UiUtils.showMessage("Web adresi girilmemiş!", hata: true);
+      return;
+    }
+
     String tamUrl = urlString.trim();
     if (!tamUrl.startsWith('http')) {
       tamUrl = 'https://$tamUrl';
@@ -178,953 +756,315 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
     if (await canLaunchUrl(url)) {
       await launchUrl(url, mode: LaunchMode.externalApplication);
     } else {
-      _mesajGoster("Link açılamadı: $tamUrl", hata: true);
-    }
-  }
-
-  void _kurlariHesapla() {
-    // Virgülleri noktaya çevirip double'a dönüştür (Lazarus: StrToFloat)
-    double usd =
-        double.tryParse(_c['kur_dolar']!.text.replaceAll(',', '.')) ?? 0;
-    double eur =
-        double.tryParse(_c['kur_euro']!.text.replaceAll(',', '.')) ?? 0;
-
-    if (usd > 0 && eur > 0) {
-      double eurUsd = eur / usd;
-      double usdEur = usd / eur;
-
-      setState(() {
-        // Değerleri yazarken anlık olarak UI'ı güncelliyoruz
-        _c['parite_euro_dolar']?.text = eurUsd.toStringAsFixed(4);
-        _c['parite_dolar_euro']?.text = usdEur.toStringAsFixed(4);
-      });
-    }
-  }
-
-  void _fiyatlariDovizeCevir() {
-    // 1. Değerleri al (Virgül/Nokta temizliği yaparak)
-    double tlSatis =
-        double.tryParse(_c['satis']!.text.replaceAll(',', '.')) ?? 0;
-    double kurUsd =
-        double.tryParse(_c['kur_dolar']!.text.replaceAll(',', '.')) ?? 0;
-    double kurEur =
-        double.tryParse(_c['kur_euro']!.text.replaceAll(',', '.')) ?? 0;
-
-    if (tlSatis <= 0) {
-      _mesajGoster("Önce geçerli bir TL Satış Fiyatı giriniz!", hata: true);
-      return;
-    }
-
-    if (kurUsd <= 0 || kurEur <= 0) {
-      _mesajGoster("Kurlar henüz çekilmemiş veya girilmemiş!", hata: true);
-      return;
-    }
-
-    // 2. Hesaplamaları yap ve editlere yaz
-    setState(() {
-      // Dolar Satış Fiyatımız = TL Satış / Dolar Kuru
-      double dolarSatis = tlSatis / kurUsd;
-      _c['dolar_satis']?.text = dolarSatis.toStringAsFixed(2);
-
-      // Euro Satış Fiyatımız = TL Satış / Euro Kuru
-      double euroSatis = tlSatis / kurEur;
-      _c['euro_satis']?.text = euroSatis.toStringAsFixed(2);
-
-      // Bilgi amaçlı pariteleri de yazalım
-      _c['parite_euro_dolar']?.text = (kurEur / kurUsd).toStringAsFixed(4);
-      _c['parite_dolar_euro']?.text = (kurUsd / kurEur).toStringAsFixed(4);
-    });
-
-    _mesajGoster("Döviz fiyatları başarıyla hesaplandı.");
-  }
-
-  Widget _tabFiyatlar() {
-    return Padding(
-      padding: const EdgeInsets.all(8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Wrap(
-            spacing: 10,
-            runSpacing: 10,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              _input("TL Satış Fiyatı", 'satis', 120),
-              _input("Dolar Kuru", 'kur_dolar', 120),
-              _input("Euro Kuru", 'kur_euro', 120),
-
-              // HESAPLA BUTONU (Lazarus'taki "Fiyatları Çevir" butonu gibi)
-            ],
-          ),
-          const SizedBox(height: 10),
-          const Text(
-            "Döviz Karşılıkları",
-            style: TextStyle(fontWeight: FontWeight.bold),
-          ),
-          const Divider(),
-          Wrap(
-            spacing: 10,
-            runSpacing: 10,
-            children: [
-              _input("Dolar Satış (\$)", 'dolar_satis', 120, readOnly: true),
-              _input("Euro Satış (€)", 'euro_satis', 120, readOnly: true),
-              _input(
-                "EUR/USD Parite",
-                'parite_euro_dolar',
-                120,
-                readOnly: true,
-              ),
-              _input(
-                "USD/EUR Parite",
-                'parite_dolar_euro',
-                120,
-                readOnly: true,
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          ElevatedButton.icon(
-            onPressed: _fiyatlariDovizeCevir, // Sadece tıklandığında çalışır
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.blueAccent,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              minimumSize: const Size(double.infinity, 40),
-            ),
-            icon: const Icon(Icons.sync_alt),
-            label: const Text("Döviz fiyatını Uygula"),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _initDatabase() async {
-    try {
-      // DİKKAT: openDatabase demiyoruz, DbHelper içindeki hazır bağlantıyı istiyoruz.
-      _db = await DbHelper().db;
-
-      if (_db != null && _db!.isOpen) {
-        _mesajGoster(">>> Bağlantı başarılı, veriler çekiliyor...");
-        setState(() {
-          _isDbInitialized = true;
-        });
-        await _verileriGetir();
-      } else {
-        throw "Veritabanı bağlantısı açılamadı!";
-      }
-    } catch (e) {
-      // print(">>> KRİTİK HATA: $e");
-      _mesajGoster("Bağlantı kurulamadı: $e", hata: true);
+      UiUtils.showMessage("Link açılamadı: $tamUrl", hata: true);
     }
   }
 
   Future<void> _verileriGetir() async {
-    if (_db == null) return;
-
-    try {
-      // Sorgu sonucunu beklerken (await) hata olursa catch yakalayacak
-      final List<Map<String, dynamic>> maps = await _db!.query(
-        'STOK',
-        orderBy: 'LDATE DESC',
-      );
-
-      setState(() {
-        _stokListesi = maps.map((item) => Stok.fromMap(item)).toList();
-        _filtreliListe = List.from(_stokListesi);
-      });
-      _mesajGoster(
-        ">>> Veriler başarıyla yüklendi: ${_stokListesi.length} adet.",
-      );
-    } catch (e) {
-      //print(">>> Sorgu Hatası: $e");
-      _mesajGoster("Liste çekilemedi: $e", hata: true);
-      // Hata olsa bile halkayı durdurmak için:
-      setState(() {
-        _isDbInitialized = true;
-      });
-    }
+    await stockListController.verileriGetir();
   }
 
+  /// 7 Farklı Barkod Sütununu Da Kapsayan Dinamik Süzgeç
   void _aramaYap(String kelime) {
-    setState(() {
-      if (kelime.isEmpty) {
-        _filtreliListe = _stokListesi;
-      } else {
-        final aranan = kelime.toLowerCase();
-        _filtreliListe = _stokListesi.where((stok) {
-          final urunAdi = stok.stokAdi.toLowerCase();
-          final barkod = stok.barkod.toLowerCase();
-          return urunAdi.contains(aranan) || barkod.contains(aranan);
-        }).toList();
-      }
-    });
+    stockListController.aramaYap(kelime);
   }
 
-  void _formuDoldur(Stok urun) {
-    setState(() {
-      _seciliStok = urun;
-      _c['stok_kod']!.text = urun.stokKod ?? "";
-      _c['stok_adi']!.text = urun.stokAdi;
-      _c['barkod']!.text = urun.barkod;
-      _c['barkod2']!.text = urun.barkod2 ?? "";
-      _c['barkod3']!.text = urun.barkod3 ?? "";
-      _c['barkod4']!.text = urun.barkod4 ?? "";
-      _c['barkod5']!.text = urun.barkod5 ?? "";
-      _c['barkod6']!.text = urun.barkod6 ?? "";
-      _c['barkod7']!.text = urun.barkod7 ?? "";
-      _c['alis']!.text = urun.alisFiyati ?? "";
-      _c['satis']!.text = urun.satisFiyati ?? "";
-      _c['dolar_alis']!.text = urun.dolarAlis ?? "";
-      _c['dolar_satis']!.text = urun.dolarSatis ?? "";
-      _c['euro_satis']!.text = urun.euroSatis ?? "";
-      _c['miktar']!.text = urun.miktar ?? "";
-      _c['marj']!.text = urun.marj ?? "";
-      _c['kdv']!.text = urun.kdv ?? "";
-      _c['lot']!.text = urun.lot ?? "";
-      _c['weight']!.text = urun.weight ?? "";
-      _c['metaTitle']!.text = urun.metaTitle ?? "";
-      _c['webLink']!.text = urun.webLink ?? "";
-      _c['Fdate']!.text = urun.Fdate ?? "";
-      _c['Ldate']!.text = urun.Ldate ?? "";
-      _c['beden']!.text = urun.beden ?? "";
-    });
-  }
+
 
   void _fiyatHesapla() {
-    // Try-parse ile sayısal değerleri alıyoruz
-    double alis = double.tryParse(_c['alis']?.text ?? '0') ?? 0;
-    double marj = double.tryParse(_c['marj']?.text ?? '0') ?? 0;
+    stockFormController.fiyatHesapla();
+  }
 
-    if (alis > 0) {
-      // Toptan Satış Formülü: Alış + (Alış * Marj / 100)
-      double sonSatis = (alis + (alis * marj / 100)).ceil().toDouble();
-
-      setState(() {
-        // Satış fiyatını 2 kuruş haneli olarak güncelle
-        _c['satis']?.text = sonSatis.toStringAsFixed(2);
-      });
-    }
+  void _dovizGirislefiyatHesapla() {
+    stockFormController.fiyatHesapla();
   }
 
   void _yeniUrunHazirla() {
-    setState(() {
-      _seciliStok = null; // Seçili ürünü sıfırla
-      _formAcikMi = true; // Formun görünmesini sağla
+    stockFormController.formuTemizle();
+  }
 
-      // Tüm metin kutularını boşalt
-      _c.forEach((key, controller) {
-        controller.clear();
+  void _stokSilOnayli() {
+    stockFormController.stokSil(
+      stockListController.verileriGetir,
+    );
+  }
+
+  void _stokDataUrunKopyala() {
+    if (stockFormController.kopyaOlarakHazirla() == null) return;
+
+    Future.delayed(const Duration(milliseconds: 300), () {
+      if (!mounted) return;
+      stockFormController.stokKodFocusNode.requestFocus();
+      stockFormController.c['stok_kod']?.selection =
+          const TextSelection.collapsed(offset: 0);
+
+      Future.microtask(() {
+        int uzunluk = stockFormController.c['stok_kod']?.text.length ?? 0;
+        if (uzunluk > 5) {
+          stockFormController.c['stok_kod']?.selection = TextSelection(
+            baseOffset: uzunluk - 5,
+            extentOffset: uzunluk,
+          );
+        }
       });
-
-      // Bugünün tarihini al (GÜN.AY.YIL formatında)
-      String bugun = DateFormat('dd.MM.yyyy').format(DateTime.now());
-
-      // Zorunlu alanlara varsayılan değerler at (Lazarus'taki gibi)
-
-      _c['miktar']?.text = "100";
-      _c['kdv']?.text = "10";
-      _c['marj']?.text = "12";
-      _c['lot']?.text = "3";
-      _c['weight']?.text = "1";
-      _c['Fdate']?.text = bugun; // İlk Giriş
-      _c['Ldate']?.text =
-          bugun; // Son Giriş (Yeni üründe ilk girişle aynı olur)
-
-      // Sekmeyi en başa (Stok Bilgisi) al
-      _tabController.animateTo(0);
     });
-
-    _mesajGoster("Yeni ürün girişi için form hazırlandı.");
   }
 
-  Future<void> _stokSil(int id) async {
-    if (_db == null) return;
-
-    try {
-      await _db!.delete('STOK', where: 'KIMLIK = ?', whereArgs: [id]);
-
-      setState(() {
-        _seciliStok = null; // Silinen ürünü seçimden kaldır
-        _formAcikMi = false; // Formu kapat
-      });
-
-      _verileriGetir(); // Listeyi güncelle
-      _mesajGoster("Ürün başarıyla silindi.");
-    } catch (e) {
-      _mesajGoster("Silme hatası: $e");
-    }
-  }
-
-  void _silmeOnayiAl() {
-    if (_seciliStok == null) return;
-
-    showDialog(
-      context: context,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text("Ürünü Sil"),
-          content: Text(
-            "'${_seciliStok!.stokAdi}' isimli ürünü silmek istediğinize emin misiniz?",
-          ),
-          actions: [
-            TextButton(
-              child: const Text("Vazgeç"),
-              onPressed: () => Navigator.of(context).pop(),
-            ),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-              child: const Text(
-                "Evet, Sil",
-                style: TextStyle(color: Colors.white),
-              ),
-              onPressed: () {
-                Navigator.of(context).pop(); // Dialog'u kapat
-                _stokSil(_seciliStok!.id!); // Silme işlemini başlat
-              },
-            ),
-          ],
-        );
-      },
-    );
-  }
-
+  // 🚀 MÜKERRER BARKOD ÖNLEME SİSTEMİYLE GÜNCELLENEN KAYIT FONKSİYONU
   Future<void> _stokKaydet() async {
-    if (_db == null) return;
+    await stockFormController.stokKaydet((s) => _urunSec(s));
 
-    // Zorunlu alan kontrolü
-    if (_c['stok_adi']!.text.trim().isEmpty) {
-      _mesajGoster("Hata: Stok adı boş bırakılamaz!");
-      return;
-    }
-
-    // Barkod boşsa Stok Kodu'nu barkod yap (Lazarus'taki otomatik tamamlama)
-    if (_c['barkod']!.text.isEmpty) {
-      _c['barkod']!.text = _c['stok_kod']!.text;
-    }
-
-    // Otomatik tamamlama mantığı
-    if (_c['weight']!.text.isEmpty) _c['weight']!.text = "1";
-    if (_c['min_adet']!.text.isEmpty) _c['min_adet']!.text = "1";
-    if (_c['lot']!.text.isEmpty) _c['lot']!.text = "3";
-    if (_c['miktar']!.text.isEmpty) _c['miktar']!.text = "100";
-    if (_c['barkod']!.text.isEmpty) _c['barkod']!.text = _c['stok_kod']!.text;
-    // Ldate ve Fdate boşsa, bugünün tarihini atıyoruz
-    String bugun = DateTime.now().toIso8601String().split('T')[0];
-    if (_c['Fdate']!.text.isEmpty) _c['Fdate']!.text = bugun;
-    if (_c['Ldate']!.text.isEmpty) _c['Ldate']!.text = bugun;
-    _c['Ldate']!.text = bugun;
-
-    // Model üzerinden veriyi hazırla
-    Stok urun = Stok(
-      id: _seciliStok?.id, // null ise INSERT, doluysa UPDATE yapar
-      stokKod: _c['stok_kod']!.text,
-      stokAdi: _c['stok_adi']!.text,
-      barkod: _c['barkod']!.text,
-      barkod2: _c['barkod2']!.text,
-      barkod3: _c['barkod3']!.text,
-      alisFiyati: _c['alis']!.text,
-      satisFiyati: _c['satis']!.text,
-      dolarAlis: _c['dolar_alis']!.text,
-      dolarSatis: _c['dolar_satis']!.text,
-      euroSatis: _c['euro_satis']!.text,
-      miktar: _c['miktar']!.text,
-      marj: _c['marj']!.text,
-      kdv: _c['kdv']!.text,
-      weight: _c['weight']!.text,
-      lot: _c['lot']!.text,
-      metaTitle: _c['metaTitle']!.text,
-      webLink: _c['webLink']!.text,
-      Fdate: _c['Fdate']!.text,
-      Ldate: _c['Ldate']!.text,
-      beden: _c['beden']!.text,
-    );
-
-    final row = urun.toMap();
-
-    try {
-      if (_seciliStok == null) {
-        // YENİ EKLEME (INSERT)
-        await _db!.insert('STOK', row);
-        _mesajGoster("Ürün başarıyla kaydedildi.");
-      } else {
-        // GÜNCELLEME (UPDATE)
-        await _db!.update(
-          'STOK',
-          row,
-          where: 'KIMLIK = ?',
-          whereArgs: [_seciliStok!.id],
-        );
-        _mesajGoster("Değişiklikler kaydedildi.");
+    if (openCartController.isOcConnected.value) {
+      // Eğer otomatik senkronize seçiliyse veya ürün zaten opencart'ta mevcutsa (güncelleme ise)
+      if (openCartController.autoSync.value ||
+          openCartController.ocProductId.value != null) {
+        await _ocSenkronizeEt();
       }
-
-      _verileriGetir(); // Listeyi yenile
-    } catch (e) {
-      _mesajGoster("Veritabanı hatası: $e");
     }
+
+    // İşlem bitince kursörü tekrar arama alanına al ve içindeki metni seç
+    Future.delayed(const Duration(milliseconds: 200), () {
+      if (mounted) {
+        stockListController.aramaFocusNode.requestFocus();
+        stockListController.aramaController.selection = TextSelection(
+          baseOffset: 0,
+          extentOffset: stockListController.aramaController.text.length,
+        );
+      }
+    });
   }
 
-  // Mesaj gösterme fonksiyonu (Lazarus: ShowMessage veya Application.MessageBox gibi)
-  void _mesajGoster(String mesaj, {bool hata = false}) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(mesaj),
-        backgroundColor: hata
-            ? Colors.red
-            : Colors.green, // Hata ise kırmızı, değilse yeşil
-        duration: const Duration(seconds: 2),
+  Widget _statusBar(BuildContext context) {
+    final size = MediaQuery.of(context).size;
+    final width = size.width.toStringAsFixed(0);
+    final height = size.height.toStringAsFixed(0);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.grey.shade100,
+        border: Border(top: BorderSide(color: Colors.grey.shade300, width: 1)),
       ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('MrmDesk Stok Yönetimi'),
-        backgroundColor: Colors.blueAccent,
-        actions: [
-          if (_seciliStok !=
-              null) // Sadece mevcut bir ürün seçiliyse silme butonu çıksın
-            IconButton(
-              icon: const Icon(Icons.delete_forever, color: Colors.redAccent),
-              tooltip: "Ürünü Sil",
-              onPressed: _silmeOnayiAl,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          // Sol Kısım: Telif ve Yazılım Bilgisi
+          Flexible(
+            child: Tooltip(
+              message: "Yazılım Geliştirme: Köksal Bebe Bilgi İşlem",
+              waitDuration: const Duration(milliseconds: 500),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Flexible(
+                    child: Text(
+                      "Marmara HGS 2026. ",
+                      style: TextStyle(color: Colors.grey[600], fontSize: 11),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  const Icon(
+                    Icons.copyright_outlined,
+                    color: Colors.grey,
+                    size: 12,
+                  ),
+                ],
+              ),
             ),
-          IconButton(
-            icon: const Icon(Icons.currency_exchange, color: Colors.amber),
-            tooltip: "Canlı Kurları Çek",
-            onPressed: _guncelKurlariCek,
           ),
+          const SizedBox(width: 8),
 
-          IconButton(
-            icon: const Icon(Icons.add_box_outlined),
-            tooltip: "Yeni Ürün Ekle",
-            onPressed: _yeniUrunHazirla,
-          ),
+          // Sağ Kısım: Ekran Boyutu ve Aktif Veritabanı Bağlantısı (Yana Yana)
+          Flexible(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // 1. Ekran Boyutu
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: Colors.blueGrey.withOpacity(0.08),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Text(
+                      "Ekran: ${width}x$height",
+                      style: TextStyle(
+                        color: Colors.blueGrey.shade700,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    "|",
+                    style: TextStyle(color: Colors.grey.shade400, fontSize: 11),
+                  ),
+                  const SizedBox(width: 8),
 
-          IconButton(
-            icon: const Icon(Icons.save),
-            tooltip: "Kaydet",
-            onPressed: _stokKaydet,
+                  // 2. Aktif Veritabanı Bağlantısı
+                  Tooltip(
+                    message:
+                        "Yerel DB: ${DbHelper.dbPath}\nResim: ${DbHelper.resimAnaYolu}\nOpencart: ${settingsController.c['oc_host']?.text} / ${settingsController.c['oc_db']?.text}",
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.storage_rounded,
+                          size: 12,
+                          color: Colors.blueGrey.shade600,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          "Bağlantı: ${DbHelper.dbPath.split('\\').last}",
+                          style: TextStyle(
+                            color: Colors.blueGrey.shade700,
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
         ],
       ),
-      body: !_isDbInitialized
-          ? const Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  CircularProgressIndicator(),
-                  SizedBox(height: 16),
-                  Text("Veritabanı bağlantısı kuruluyor..."),
-                ],
-              ),
-            )
-          : Row(
-              children: [
-                // --- SOL LİSTE (Arama ve Ürünler) ---
-                Container(
-                  width: 500, // Genişliği biraz optimize ettim
-                  decoration: BoxDecoration(
-                    border: Border(
-                      right: BorderSide(color: Colors.grey.shade300),
-                    ),
-                  ),
-                  child: Column(
-                    children: [
-                      Padding(
-                        padding: const EdgeInsets.all(8.0),
-                        child: TextField(
-                          controller: _aramaController,
-                          onChanged: _aramaYap,
-                          decoration: InputDecoration(
-                            labelText: "Hızlı Ara (Ad veya Barkod)",
-                            prefixIcon: const Icon(Icons.search),
-                            border: const OutlineInputBorder(),
-                            suffixIcon: _aramaController.text.isNotEmpty
-                                ? IconButton(
-                                    icon: const Icon(Icons.clear),
-                                    onPressed: () {
-                                      _aramaController.clear();
-                                      _aramaYap("");
-                                    },
-                                  )
-                                : null,
-                          ),
-                        ),
-                      ),
-                      Expanded(
-                        child: ListView.builder(
-                          itemCount: _filtreliListe.length,
-                          itemBuilder: (context, index) {
-                            final stok = _filtreliListe[index];
-                            return ListTile(
-                              dense: false,
-                              visualDensity: const VisualDensity(
-                                horizontal: 0,
-                                vertical: -4,
-                              ),
-                              title: Text(
-                                stok.stokAdi,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 12,
-                                ),
-                              ),
-                              subtitle: Text(
-                                "Barkod: ${stok.barkod} | Stok: ${stok.miktar} |  Satış: ${stok.satisFiyati} TL | ${stok.dolarSatis} \$ | ${stok.euroSatis} €",
-                              ),
-                              selected: _seciliStok?.id == stok.id,
-                              selectedTileColor: Colors.blue.withValues(
-                                alpha: 0.1,
-                              ),
-                              onTap: () async {
-                                // 1. Sadece 'varsa' uyandırır, yoksa zorlamaz (baglan içindeki kontrol sayesinde)
-                                bool baglantiVarMi = await _ocService.baglan();
-
-                                // 2. YEREL İŞLEMLER (Her zaman çalışır)
-                                _formuDoldur(stok);
-                                setState(() {
-                                  _formAcikMi = false;
-                                  _seciliStok = stok;
-                                  _isOcConnected =
-                                      baglantiVarMi; // Bağlantı durumunu güncel tutalım
-                                });
-
-                                // 3. OPENCART İŞLEMİ (Sadece bağlantı varsa)
-                                if (baglantiVarMi) {
-                                  _idSorgula();
-                                } else {
-                                  print(
-                                    "OpenCart bağlantısı aktif değil, sadece yerel bilgiler yüklendi.",
-                                  );
-                                  // Burada SnackBar göstermene gerek yok, çünkü bağlantı kurmamak senin tercihin.
-                                }
-                              },
-                            );
-                          },
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-
-                // --- SAĞ DETAY PANELİ ---
-                Expanded(
-                  child: (_seciliStok == null && !_formAcikMi)
-                      ? Center(
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Icon(
-                                Icons.inventory_2_outlined,
-                                size: 80,
-                                color: Colors.grey.shade400,
-                              ),
-                              const SizedBox(height: 16),
-                              Text(
-                                "Düzenlemek için listeden bir ürün seçin\nveya yeni eklemek için (+) butonuna basın.",
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                  color: Colors.grey.shade600,
-                                  fontSize: 16,
-                                ),
-                              ),
-                            ],
-                          ),
-                        )
-                      : Column(
-                          children: [
-                            TabBar(
-                              controller: _tabController,
-                              labelColor: Colors.blueAccent,
-                              unselectedLabelColor: Colors.grey,
-                              indicatorColor: Colors.blueAccent,
-                              tabs: const [
-                                Tab(text: "Stok Bilgisi"),
-                                Tab(text: "Barkodlar"),
-                                Tab(text: "Döviz & Fiyatlar"),
-                                Tab(text: "Döviz Kurları"),
-                              ],
-                            ),
-                            Expanded(
-                              child: TabBarView(
-                                controller: _tabController,
-                                children: [
-                                  _stokBilgisiSekmesi(),
-                                  _barkodlarSekmesi(),
-                                  _tabFiyatlar(),
-                                  _dovizBolumu(),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                ),
-              ],
-            ),
     );
   }
 
-  Widget _statusBar() {
-    return Align(
-      alignment: Alignment.bottomRight,
-      child: Padding(
-        padding: const EdgeInsets.all(8.0),
-        child: Tooltip(
-          message:
-              "Veritabanı: ${DbHelper.dbPath}\nResim: ${DbHelper.resimAnaYolu}",
-          child: Text(
-            "Aktif Bağlantı: ${DbHelper.dbPath.split('\\').last}", // Sadece dosya adını gösterir
-            style: TextStyle(
-              color: Colors.blueGrey,
-              fontSize: 12,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
+  // 🚀 YENİDEN TASARLANAN VE KUR SERVİSİNE BAĞLANAN METOT
   Future<void> _guncelKurlariCek() async {
     try {
-      // Ücretsiz ve hızlı bir döviz API'si (TCMB bazlı kurlar için alternatif)
-      final response = await http.get(
-        Uri.parse('https://api.exchangerate-api.com/v4/latest/TRY'),
-      );
+      bool basarili = await _kurService.kurlariGuncelle();
 
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        final rates = data['rates'];
+      if (basarili) {
+          settingsController.c['kur_dolar']?.text = _kurService.usd
+              .toStringAsFixed(4);
+          settingsController.c['kur_euro']?.text = _kurService.eur
+              .toStringAsFixed(4);
+          settingsController.c['parite_euro_dolar']?.text = _kurService
+              .eurUsdParitesi
+              .toStringAsFixed(4);
+          settingsController.c['parite_dolar_euro']?.text = _kurService
+              .usdEurParitesi
+              .toStringAsFixed(4);
 
-        // API 1 TRY = X USD şeklinde verdiği için tersini alıyoruz (1 USD = ? TRY)
-        double usdKur = 1 / rates['USD'];
-        double eurKur = 1 / rates['EUR'];
-
-        setState(() {
-          _c['kur_dolar']?.text = usdKur.toStringAsFixed(4);
-          _c['kur_euro']?.text = eurKur.toStringAsFixed(4);
-        });
-
-        // Zaten addListener kullandığımız için _kurlariHesapla() otomatik tetiklenecek!
-        _mesajGoster(
-          "Kurlar güncellendi: USD: ${usdKur.toStringAsFixed(2)} - EUR: ${eurKur.toStringAsFixed(2)}",
+        stockFormController.fiyatHesapla();
+        UiUtils.showMessage(
+          "Kurlar güncellendi: USD: ${_kurService.usd.toStringAsFixed(2)} - EUR: ${_kurService.eur.toStringAsFixed(2)}",
         );
       } else {
-        _mesajGoster("Kur çekme hatası: Sunucu cevap vermedi", hata: true);
+        UiUtils.showMessage(
+          "Kur çekme hatası: Döviz sağlayıcı sunucusuna erişilemedi.",
+          hata: true,
+        );
       }
     } catch (e) {
-      _mesajGoster("Bağlantı hatası: İnternetini kontrol et!", hata: true);
+      UiUtils.showMessage("Bağlantı hatası: $e", hata: true);
     }
   }
 
-  Widget _dovizBolumu() {
-    return Column(
-      children: [
-        const Text(
-          "Güncel Döviz & Parite",
-          style: TextStyle(fontWeight: FontWeight.bold),
-        ),
-        const SizedBox(height: 10),
-        Wrap(
-          spacing: 10,
-          runSpacing: 10,
-          children: [
-            _input(
-              "Dolar Alış (₺)",
-              'kur_dolar',
-              120,
-              onChanged: (v) => _kurlariHesapla(),
-            ),
-            _input(
-              "Euro Alış (₺)",
-              'kur_euro',
-              120,
-              onChanged: (v) => _kurlariHesapla(),
-            ),
-            const SizedBox(width: 20),
-            _input("EUR/USD Parite", 'parite_euro_dolar', 120, readOnly: true),
-            _input("USD/EUR Parite", 'parite_dolar_euro', 120, readOnly: true),
-
-            // Kurları Getir Butonu (Lazarus: SpeedButton gibi)
-            ElevatedButton.icon(
-              onPressed: () => _guncelKurlariCek(),
-              icon: const Icon(Icons.download),
-              label: const Text("Kurları Güncelle"),
-            ),
-          ],
-        ),
-        const SizedBox(height: 20),
-      ],
+  Widget _ayarlarSekmesi() {
+    return AyarlarTabWidget(
+      buildInput: (label, key, width, {bool isPassword = false}) {
+        return _input(
+          label,
+          key,
+          width,
+          isPassword: isPassword,
+          externalController: settingsController.c[key],
+        );
+      },
+      onSave: settingsController.sabitAyarlariYaz,
     );
   }
 
   Widget _stokBilgisiSekmesi() {
-    // --- 1. Dinamik Yol Hesaplama (Hassas Ayar) ---
-    String stokAdi = _c['stok_adi']!.text;
-    String stokKod = _c['stok_kod']!.text;
-
-    // Markayı alırken hata payını azaltıyoruz
-    String marka = "Genel";
-    if (stokAdi.isNotEmpty) {
-      marka = stokAdi
-          .split(' ')[0]
-          .toUpperCase(); // Büyük harfe zorla (Klasör ismi için)
-    }
-
-    List<String> uzantilar = ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG'];
-
-    // DbHelper'dan gelen yolun sonuna \ eklediğimizden emin oluyoruz
-    String anaDizin = DbHelper.resimAnaYolu;
-    if (!anaDizin.endsWith('\\')) anaDizin += '\\';
-
-    String bulunanTamYol = '';
-
-    // Döngü ile dosyayı arıyoruz
-    for (String uzanti in uzantilar) {
-      // Örn: C:\wamp\www\OC3\image\catalog\SAMSUNG\A50.jpg
-      String testYolu = '$anaDizin$marka\\$stokKod$uzanti';
-      if (File(testYolu).existsSync()) {
-        bulunanTamYol = testYolu;
-        break;
+    return Obx(() {
+      if (stockFormController.seciliStok.value == null &&
+          !stockListController.formAcikMi.value) {
+        return _buildBosDurumMesaji();
       }
-    }
 
-    // Eğer marka klasöründe yoksa, doğrudan catalog içinde aramayı dene (Alternatif)
-    if (bulunanTamYol.isEmpty) {
-      for (String uzanti in uzantilar) {
-        String testYolu = '$anaDizin$stokKod$uzanti';
-        if (File(testYolu).existsSync()) {
-          bulunanTamYol = testYolu;
-          break;
-        }
-      }
-    }
-
-    File resimDosyasi = File(bulunanTamYol);
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // SOL TARAF: Inputlar
-          Expanded(
-            flex: 1,
-            child: Wrap(
-              spacing: 10,
-              runSpacing: 10,
-              children: [
-                _input("Stok Kodu", 'stok_kod', 190),
-                _input("Stok Adı", 'stok_adi', 400),
-                const Divider(),
-                _input("Barkod", 'barkod', 190),
-                _input("Barkod 2", 'barkod2', 195),
-                _input("Barkod 3", 'barkod3', 195),
-                const Divider(),
-                _input("Alış (TL)", 'alis', 120),
-                _input("Marj %", 'marj', 120),
-                _input("Satış (TL)", 'satis', 120),
-                const Divider(),
-                _input("Dolar Alış (\$)", 'dolar_alis', 120),
-                _input("Dolar Satış (\$)", 'dolar_satis', 120),
-                _input("Euro Satış (€)", 'euro_satis', 120),
-
-                const Divider(),
-                _input("Miktar", 'miktar', 120),
-                _input("KDV %", 'kdv', 120),
-                _input("Beden", 'beden', 120),
-                _input("Lot", 'lot', 120),
-                _input("Ağırlık", 'weight', 120),
-                const Divider(),
-                _tabFiyatlar(),
-                const Divider(),
-                _input("Meta Title", 'metaTitle', 380),
-
-                _input("İlk Giriş Tarihi", 'Fdate', 380),
-                _input("Son Giriş Tarihi", 'Ldate', 380),
-                // _input("Web Link", 'webLink', 800),
-                TextField(
-                  controller: _c['webLink'],
-                  decoration: InputDecoration(
-                    labelText: "Web Link",
-                    border: const OutlineInputBorder(),
-                    suffixIcon: IconButton(
-                      icon: const Icon(Icons.open_in_new),
-                      onPressed: () => _linkiAc(_c['webLink']?.text ?? ""),
-                    ),
-                  ),
-                ),
-
-                // 1. BUTON: OPENCARTBAĞLANTI BUTONU
-                const SizedBox(height: 1),
-                ElevatedButton.icon(
-                  onPressed: _ocBaglantisiniYonet,
-                  icon: Icon(_isOcConnected ? Icons.link : Icons.link_off),
-                  label: Text(
-                    _isOcConnected
-                        ? "OPENCART BAĞLANTISI AKTİF"
-                        : "OPENCART'A BAĞLAN",
-                  ),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: _isOcConnected
-                        ? Colors.green.shade700
-                        : Colors.grey.shade700,
-                    foregroundColor: Colors.white,
-                    minimumSize: const Size(double.infinity, 40),
-                  ),
-                ),
-
-                // 2. BUTON: OPENCART SENKRONİZASYONU BUTONU (Sadece bağlantı varken görünür)
-                const SizedBox(height: 1),
-                if (_isOcConnected)
-                  ElevatedButton.icon(
-                    onPressed: _ocSenkronizeEt,
-                    // ID yoksa "Yükle", varsa "Güncelle" ikonu ve yazısı
-                    icon: Icon(
-                      _ocProductId == null ? Icons.cloud_upload : Icons.sync,
-                    ),
-                    label: Text(
-                      _ocProductId == null
-                          ? "ÜRÜNÜ OPENCART'A YÜKLE"
-                          : "BİLGİLERİ GÜNCELLE",
-                    ),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.orange.shade800,
-                      foregroundColor: Colors.white,
-                      minimumSize: const Size(double.infinity, 45),
-                    ),
-                  ),
-
-                // 3. BUTON: STOK KAYDET/ GÜNCELLE BUTONU
-                const SizedBox(height: 1),
-                ElevatedButton.icon(
-                  onPressed: _stokKaydet,
-                  icon: const Icon(Icons.save),
-                  label: const Text("KAYDET / GÜNCELLE"),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.blueAccent,
-                    foregroundColor: Colors.white,
-                    minimumSize: const Size(double.infinity, 40),
-                  ),
-                ),
-              ],
-            ),
+      return StokDetayFormWidget(
+        stokKodFocusNode: stockFormController.stokKodFocusNode,
+        tabDovizFiyatlar: KurFiyatAlaniWidget(
+          buildInput: _input,
+          fiyatlariDovizeCevir: () =>
+              stockFormController.fiyatlariDovizeCevir(),
+          sabitfiyatlariDovizeCevir: () =>
+              stockFormController.sabitfiyatlariDovizeCevir(),
+        ),
+        openCartPreview: Obx(
+          () => OpenCartPreviewWidget(
+            isOcConnected: openCartController.isOcConnected.value,
+            ocProductId: openCartController.ocProductId.value,
+            onSenkronizeEt: _ocSenkronizeEt,
+            ocData: openCartController.ocData.isNotEmpty
+                ? openCartController.ocData
+                : null,
+            autoSync: openCartController.autoSync.value,
+            onAutoSyncChanged: (val) {
+              openCartController.autoSync.value = val ?? false;
+            },
+            onDurumGuncelle: _ocDurumGuncelle,
+            onUrunuTamamenSil: _ocUrunuTamamenSil,
+            onStateUpdate: () {},
           ),
-
-          // SAĞ TARAF: Resim Önizleme
-          Expanded(
-            flex: 1,
-            child: Column(
-              children: [
-                Container(
-                  //Resim gösteren kutu
-                  height: 350, // Biraz daha büyüttüm
-                  width: double.infinity,
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    border: Border.all(color: Colors.grey.shade300),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: bulunanTamYol.isNotEmpty && resimDosyasi.existsSync()
-                      ? ClipRRect(
-                          borderRadius: BorderRadius.circular(12),
-                          child: Image.file(
-                            resimDosyasi,
-                            fit: BoxFit.contain,
-                            // Dosya sistemde var ama resim bozuksa:
-                            errorBuilder: (context, error, stackTrace) =>
-                                const Icon(
-                                  Icons.broken_image,
-                                  size: 50,
-                                  color: Colors.orange,
-                                ),
-                          ),
-                        )
-                      : Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(
-                              Icons.image_not_supported,
-                              size: 50,
-                              color: Colors.grey[300],
-                            ),
-                            const SizedBox(height: 10),
-                            Text(
-                              "Resim Bulunamadı",
-                              style: TextStyle(color: Colors.grey[600]),
-                            ),
-                            Text(
-                              "$marka\\$stokKod",
-                              style: const TextStyle(
-                                fontSize: 10,
-                                color: Colors.grey,
-                              ),
-                            ),
-                          ],
-                        ),
-                ),
-
-                if (_isOcConnected && _ocProductId != null) ...[
-                  const SizedBox(height: 15),
-                  _buildOpenCartKarsilastirmaPaneli(),
-                ],
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
+        ),
+        buildInput:
+            (
+              label,
+              key,
+              width, {
+              bool buyukHarf = false,
+              FocusNode? focusNode,
+              Color? themeColor,
+            }) {
+              return _input(
+                label,
+                key,
+                width,
+                buyukHarf: buyukHarf,
+                focusNode: focusNode,
+                themeColor: themeColor,
+              );
+            },
+      );
+    });
   }
 
-  Widget _barkodlarSekmesi() {
-    if (_seciliStok == null) {
-      return const Center(child: Text("Lütfen bir ürün seçin."));
+  Future<void> _whatsappIlePaylas(String resimYolu) async {
+    String stokAdi = stockFormController.c['stok_adi']?.text ?? "Ürün";
+    String mesaj = "*$stokAdi*\n\n";
+
+    if (_seciliTl.value) {
+      mesaj += "💰 Fiyat: ${stockFormController.c['satis']?.text ?? '0'} TL\n";
+    }
+    if (_seciliEuro.value) {
+      mesaj +=
+          "💶 Euro: ${stockFormController.c['euro_satis']?.text ?? '0'} €\n";
+    }
+    if (_seciliDolar.value) {
+      mesaj +=
+          "💵 Dolar: ${stockFormController.c['dolar_satis']?.text ?? '0'} \$\n";
     }
 
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            "Ek Barkod Tanımları",
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-              color: Colors.blueAccent,
-            ),
-          ),
-          const SizedBox(height: 20),
-          // Lazarus'taki yan yana dizilen Edit'ler gibi Wrap kullanıyoruz
-          Wrap(
-            spacing: 16, // Yatay boşluk
-            runSpacing: 16, // Dikey boşluk
-            children: [
-              _input("Ek Barkod 3", 'barkod4', 220),
-              _input("Ek Barkod 4", 'barkod5', 220),
-              _input("Ek Barkod 5", 'barkod6', 220),
-              _input("Ek Barkod 6", 'barkod7', 220),
-            ],
-          ),
-          const Divider(height: 50),
-          _statusBar(),
-          // Bilgilendirme veya ekstra butonlar buraya gelebilir
-          Row(
-            children: [
-              const Icon(Icons.info_outline, color: Colors.grey),
-              const SizedBox(width: 8),
-              Text(
-                "Bu barkodlar arama sonuçlarında da geçerlidir.",
-                style: TextStyle(color: Colors.grey[600], fontSize: 13),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
+    try {
+      if (resimYolu.isNotEmpty && File(resimYolu).existsSync()) {
+        await Share.shareXFiles([XFile(resimYolu)], text: mesaj);
+      } else {
+        await Share.share(mesaj);
+      }
+    } catch (e) {
+      print("WhatsApp Paylaşım Hatası: $e");
+    }
   }
 
   Widget _input(
@@ -1133,151 +1073,46 @@ class _StokAnaSayfaState extends State<StokAnaSayfa>
     double width, {
     ValueChanged<String>? onChanged,
     bool readOnly = false,
+    bool buyukHarf = false,
+    bool isPassword = false,
+    FocusNode? focusNode,
+    TextEditingController? externalController,
+    Color? themeColor,
   }) {
-    return SizedBox(
+    return CustomInputWidget(
+      label: label,
+      inputKey: key,
       width: width,
-      child: GestureDetector(
-        // İşte çift tıklama özelliği burada tanımlanıyor
-        onDoubleTap: () {
-          if (key == 'metaTitle') {
-            setState(() {
-              // Stok adı boş değilse Meta Title'a kopyala
-              _c['metaTitle']?.text = _c['stok_adi']?.text ?? "";
-            });
-            _mesajGoster("Stok adı Meta Title alanına kopyalandı.");
-          }
-        },
-        child: TextFormField(
-          controller: _c[key],
-          // --- ENTER'A BASINCA SONRAKİNE GEÇ ---
-          textInputAction:
-              TextInputAction.next, // Klavyede "İleri" butonu gösterir
-          onFieldSubmitted: (value) {
-            // Bu komut Delphi'deki SelectNext(ActiveControl, True, True) ile aynı işi yapar
-            FocusScope.of(context).nextFocus();
-          },
-          // ------------------------------------
-          decoration: InputDecoration(
-            labelText: label,
-            border: const OutlineInputBorder(),
-            isDense: true,
-            // Kullanıcıya çift tıklayabileceğini hissettirmek için bir ipucu (isteğe bağlı)
-            suffixIcon: key == 'metaTitle'
-                ? const Icon(Icons.copy, size: 16)
-                : null,
-          ),
-          onChanged: (value) {
-            if (key == 'alis' || key == 'marj') {
-              _fiyatHesapla();
-            }
-            if (key == 'stok_kod' || key == 'stok_adi') {
-              setState(() {}); // Resim önizlemesini yenilemek için
-            }
-          },
-        ),
-      ),
+      onChanged: onChanged,
+      readOnly: readOnly,
+      buyukHarf: buyukHarf,
+      isPassword: isPassword,
+      focusNode: focusNode,
+      externalController: externalController,
+      themeColor: themeColor,
+      fiyatHesapla: _fiyatHesapla,
+      dovizGirislefiyatHesapla: _dovizGirislefiyatHesapla,
+      stokKaydet: _stokKaydet,
     );
   }
 
-  // BU İKİSİ BAŞKA FONKSİYONLARIN İÇİNDE OLMAMALI, AYRI OLMALI
-  Widget _buildOpenCartKarsilastirmaPaneli() {
-    if (!_isOcConnected || _ocProductId == null) return const SizedBox.shrink();
-
-    return FutureBuilder<Map<String, dynamic>?>(
-      future: _ocService.urunDetayGetir(_ocProductId!),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Padding(
-            padding: EdgeInsets.all(8.0),
-            child: LinearProgressIndicator(),
-          );
-        }
-
-        final ocData = snapshot.data;
-        if (ocData == null) return const SizedBox.shrink();
-
-        return Container(
-          width: double.infinity,
-          margin: const EdgeInsets.only(top: 10, bottom: 10),
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            color: Colors.blue.shade50,
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: Colors.blue.shade200, width: 1.5),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  const Icon(Icons.cloud_sync, color: Colors.blue),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      "OpenCart Canlı: ${ocData['name'] ?? ''}",
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 14,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const Divider(color: Colors.blue),
-              Wrap(
-                spacing: 30,
-                runSpacing: 12,
-                children: [
-                  _ocVeriSutunu(
-                    "STOK MİKTARI",
-                    "${ocData['quantity'] ?? 0} Adet",
-                    Icons.inventory,
-                  ),
-                  _ocVeriSutunu(
-                    "FİYAT",
-                    "${double.tryParse(ocData['price'].toString())?.toStringAsFixed(2) ?? '0.00'} TL",
-                    Icons.sell,
-                  ),
-                  _ocVeriSutunu(
-                    "BARKOD / SKU",
-                    "${ocData['ean'] ?? '-'} / ${ocData['sku'] ?? '-'}",
-                    Icons.qr_code,
-                  ),
-
-                  _ocVeriSutunu(
-                    "BEDEN / LOT",
-                    "${ocData['location'] ?? '-'}",
-                    Icons.straighten,
-                  ),
-                ],
-              ),
-            ],
-          ),
-        );
-      },
-    );
+  void _ocBaglantisiniYonet() async {
+    if (openCartController.isOcConnected.value) {
+      await openCartController.disconnect();
+    } else {
+      openCartController.connect(stockFormController.c["stok_kod"]?.text ?? "");
+    }
   }
 
-  Widget _ocVeriSutunu(String baslik, String deger, IconData icon) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 14, color: Colors.blueGrey),
-            const SizedBox(width: 4),
-            Text(
-              baslik,
-              style: const TextStyle(fontSize: 10, color: Colors.blueGrey),
-            ),
-          ],
-        ),
-        Text(
-          deger,
-          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-        ),
-      ],
-    );
+  Future<void> _ocSenkronizeEt() async {
+    await openCartController.senkronizeEt();
+  }
+
+  Future<void> _ocUrunuTamamenSil() async {
+    await openCartController.urunSil();
+  }
+
+  Future<void> _ocDurumGuncelle(String yeniDurum) async {
+    await openCartController.durumDegistir();
   }
 }
